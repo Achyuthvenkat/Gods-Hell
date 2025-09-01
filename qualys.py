@@ -1,51 +1,136 @@
+# reference qualys.py
+
 import requests
 import xml.etree.ElementTree as ET
 import csv
 import os
 from dotenv import load_dotenv
 from tqdm import tqdm
+import time
 
 load_dotenv("c.env")
 
 # === User configuration ===
-QUALYS_API_URL = os.getenv('QUALYS_API_URL')
-USERNAME = os.getenv('USERNAME1')  
-PASSWORD = os.getenv('PASSWORD')
+QUALYS_API_URL = os.getenv(
+    "QUALYS_API_URL",
+    "https://qualysapi.qg2.apps.qualys.com/api/2.0/fo/asset/host/vm/detection/",
+)
+USERNAME = os.getenv("USERNAME1")
+PASSWORD = os.getenv("PASSWORD")
+QUALYS_KB_API_URL = "https://qualysapi.qg2.apps.qualys.com/api/2.0/fo/knowledge_base/vuln/"  # KnowledgeBase API
 
 # Request parameters: filter by confirmed vulnerabilities (vulnerability type)
 # You can adjust other parameters like vm_processed_after, truncation_limit as needed
 REQUEST_PARAMS = {
-    'action': 'list',
-    'output_format': 'XML',
-    'truncation_limit': 100,  # adjust max results per request
+    "action": "list",
+    "output_format": "XML",
+    "truncation_limit": 100,  # adjust max results per request
     # 'status': 'Active,New,Re-Opened',    # by default shows Active, New, Re-Opened
     # Add other filters such as vm_processed_after='2023-01-01T00:00:00Z' if needed
     # 'detection_updated_since':'2025-08-08T07:00:00Z'
-    'show_qds': '1',
-    'show_qds_factors':'1'
+    "show_qds": "1",
+    "show_qds_factors": "1",
 }
+
+qid_title_cache = {}
+
+
+def fetch_vulnerability_titles(qids_list):
+    """
+    Fetch vulnerability titles for a list of QIDs from KnowledgeBase API.
+    """
+    if not qids_list:
+        return {}
+
+    # Remove duplicates and filter out cached QIDs
+    unique_qids = list(set(qids_list) - set(qid_title_cache.keys()))
+
+    if not unique_qids:
+        return qid_title_cache
+
+    print(f"Fetching titles for {len(unique_qids)} unique QIDs...")
+
+    # Process QIDs in batches of 100 (API limitation)
+    batch_size = 100
+    headers = {"X-Requested-With": "requests"}
+
+    for i in tqdm(
+        range(0, len(unique_qids), batch_size), desc="Fetching titles", unit="batch"
+    ):
+        batch_qids = unique_qids[i : i + batch_size]
+        qids_param = ",".join(map(str, batch_qids))
+
+        kb_params = {
+            "action": "list",
+            "ids": qids_param,
+            "details": "Basic",  # Get basic details including title
+        }
+
+        try:
+            response = requests.post(
+                QUALYS_KB_API_URL,
+                auth=(USERNAME, PASSWORD),
+                data=kb_params,
+                headers=headers,
+            )
+
+            if response.status_code == 200:
+                parse_kb_response(response.text)
+            else:
+                print(
+                    f"Warning: Failed to fetch titles for batch {i//batch_size + 1}. Status: {response.status_code}"
+                )
+                # Add placeholder titles for failed QIDs
+                for qid in batch_qids:
+                    qid_title_cache[qid] = f"Title unavailable for QID {qid}"
+
+            # Rate limiting - small delay between requests
+            time.sleep(0.5)
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching titles for batch {i//batch_size + 1}: {e}")
+            # Add placeholder titles for failed QIDs
+            for qid in batch_qids:
+                qid_title_cache[qid] = f"Error fetching title for QID {qid}"
+
+    return qid_title_cache
+
+
+def parse_kb_response(xml_data):
+    """
+    Parse KnowledgeBase API response to extract QID to title mappings.
+    """
+    try:
+        root = ET.fromstring(xml_data)
+
+        for vuln in root.findall(".//VULN"):
+            qid = vuln.findtext("QID")
+            title = vuln.findtext("TITLE")
+
+            if qid and title:
+                qid_title_cache[qid] = title.strip()
+
+    except ET.ParseError as e:
+        print(f"Error parsing KnowledgeBase response: {e}")
+
 
 def fetch_host_vm_detection():
     print("Fetching Host VM Detection data...")
 
     # Add required X-Requested-With header
-    headers = {
-        'X-Requested-With': 'requests'
-    }
+    headers = {"X-Requested-With": "requests"}
 
     response = requests.post(
-        QUALYS_API_URL,
-        auth=(USERNAME,PASSWORD),
-        data=REQUEST_PARAMS,
-        headers=headers
+        QUALYS_API_URL, auth=(USERNAME, PASSWORD), data=REQUEST_PARAMS, headers=headers
     )
-    
+
     if response.status_code != 200:
         print(f"API call failed with status code {response.status_code}")
         print(response.text)
         return None
 
     return response.text
+
 
 def parse_detection_xml(xml_data):
     """
@@ -55,125 +140,184 @@ def parse_detection_xml(xml_data):
 
     root = ET.fromstring(xml_data)
     results = []
+    unique_qids = set()
 
-    hosts = root.findall('.//HOST')
+    hosts = root.findall(".//HOST")
+    print("Collecting unique QIDs...")
+    for host in hosts:
+        detections = host.findall("DETECTION_LIST/DETECTION")
+        for det in detections:
+            qid = det.findtext("QID")
+            if qid:
+                unique_qids.add(qid)
 
-    # Parsing based on Qualys Host Detection XML structure:
-    # HOST_LIST_VM_DETECTION_OUTPUT / RESPONSE / HOST_LIST / HOST / DETECTION_LIST / DETECTION
+        # Fetch titles for all unique QIDs
+    if unique_qids:
+        fetch_vulnerability_titles(list(unique_qids))
+
+    # Second pass: parse all detection data
+    print("Parsing host detection data...")
     for host in tqdm(hosts, desc="Parsing hosts", unit="host"):
-        asset_id = host.findtext('ID')
-        asset_ip = host.findtext('IP')
-        asset_name = host.findtext('DNS')  # Changed from DNS_NAME to DNS
-        netbios = host.findtext('NETBIOS')
-        os_info = host.findtext('OS')
-        
+        asset_id = host.findtext("ID")
+        asset_ip = host.findtext("IP")
+        asset_name = host.findtext("DNS")  # Changed from DNS_NAME to DNS
+        netbios = host.findtext("NETBIOS")
+        os_info = host.findtext("OS")
+
         # Handle asset tags if they exist
-        asset_tags_elems = host.findall('TAG_LIST/TAG')
-        asset_tags = ','.join([tag.findtext('NAME') for tag in asset_tags_elems if tag.findtext('NAME')]) if asset_tags_elems else ''
+        asset_tags_elems = host.findall("TAG_LIST/TAG")
+        asset_tags = (
+            ",".join(
+                [
+                    tag.findtext("NAME")
+                    for tag in asset_tags_elems
+                    if tag.findtext("NAME")
+                ]
+            )
+            if asset_tags_elems
+            else ""
+        )
 
         # Get last scan information
-        last_scan_datetime = host.findtext('LAST_SCAN_DATETIME')
-        last_vm_scanned_date = host.findtext('LAST_VM_SCANNED_DATE')
+        last_scan_datetime = host.findtext("LAST_SCAN_DATETIME")
+        last_vm_scanned_date = host.findtext("LAST_VM_SCANNED_DATE")
 
-        detections = host.findall('DETECTION_LIST/DETECTION')
+        detections = host.findall("DETECTION_LIST/DETECTION")
         for det in detections:
-            qid = det.findtext('QID')
-            unique_vuln_id = det.findtext('UNIQUE_VULN_ID')
-            vuln_type = det.findtext('TYPE')  # Confirmed, Potential, Information Gathered
-            severity = det.findtext('SEVERITY')
-            port = det.findtext('PORT')
-            protocol = det.findtext('PROTOCOL')
-            ssl = det.findtext('SSL')
-            status = det.findtext('STATUS')  # Active, New, Fixed, Re-Opened
-            first_found = det.findtext('FIRST_FOUND_DATETIME')  # Changed from FIRST_DETECTED
-            last_found = det.findtext('LAST_FOUND_DATETIME')    # Changed from LAST_DETECTED
-            last_test = det.findtext('LAST_TEST_DATETIME')
-            last_update = det.findtext('LAST_UPDATE_DATETIME')
-            times_found = det.findtext('TIMES_FOUND')
-            results_text = det.findtext('RESULTS')
-            
+            qid = det.findtext("QID")
+            unique_vuln_id = det.findtext("UNIQUE_VULN_ID")
+            vuln_type = det.findtext(
+                "TYPE"
+            )  # Confirmed, Potential, Information Gathered
+            severity = det.findtext("SEVERITY")
+            port = det.findtext("PORT")
+            protocol = det.findtext("PROTOCOL")
+            ssl = det.findtext("SSL")
+            status = det.findtext("STATUS")  # Active, New, Fixed, Re-Opened
+            first_found = det.findtext(
+                "FIRST_FOUND_DATETIME"
+            )  # Changed from FIRST_DETECTED
+            last_found = det.findtext(
+                "LAST_FOUND_DATETIME"
+            )  # Changed from LAST_DETECTED
+            last_test = det.findtext("LAST_TEST_DATETIME")
+            last_update = det.findtext("LAST_UPDATE_DATETIME")
+            times_found = det.findtext("TIMES_FOUND")
+            results_text = det.findtext("RESULTS")
+
+            vuln_title = qid_title_cache.get(qid, f"Title not found for QID {qid}")
+
             # QDS (Qualys Detection Score) if available
-            qds_elem = det.find('QDS')
-            qds = qds_elem.text if qds_elem is not None else ''
-            qds_severity = qds_elem.get('severity') if qds_elem is not None else ''
+            qds_elem = det.find("QDS")
+            qds = qds_elem.text if qds_elem is not None else ""
+            qds_severity = qds_elem.get("severity") if qds_elem is not None else ""
 
             # QDS Factors if available
             qds_factors = []
-            qds_factors_elem = det.find('QDS_FACTORS')
+            qds_factors_elem = det.find("QDS_FACTORS")
             if qds_factors_elem is not None:
-                for factor in qds_factors_elem.findall('QDS_FACTOR'):
-                    factor_name = factor.get('name')
+                for factor in qds_factors_elem.findall("QDS_FACTOR"):
+                    factor_name = factor.get("name")
                     factor_value = factor.text
                     if factor_name and factor_value:
                         qds_factors.append(f"{factor_name}:{factor_value}")
-            qds_factors_str = '; '.join(qds_factors)
+            qds_factors_str = "; ".join(qds_factors)
 
-            results.append({
-                'AssetID': asset_id,
-                'AssetIP': asset_ip,
-                'AssetName': asset_name,
-                'NetBIOS': netbios,
-                'OS': os_info,
-                'AssetTags': asset_tags,
-                'LastScanDateTime': last_scan_datetime,
-                'LastVMScannedDate': last_vm_scanned_date,
-                'UniqueVulnID': unique_vuln_id,
-                'QID': qid,
-                'Type': vuln_type,
-                'Severity': severity,
-                'Port': port,
-                'Protocol': protocol,
-                'SSL': ssl,
-                'Status': status,
-                'FirstFoundDateTime': first_found,
-                'LastFoundDateTime': last_found,
-                'LastTestDateTime': last_test,
-                'LastUpdateDateTime': last_update,
-                'TimesFound': times_found,
-                'Results': results_text,
-                'QDS': qds,
-                'QDSSeverity': qds_severity,
-                'QDSFactors': qds_factors_str
-            })
+            results.append(
+                {
+                    "AssetID": asset_id,
+                    "AssetIP": asset_ip,
+                    "AssetName": asset_name,
+                    "NetBIOS": netbios,
+                    "OS": os_info,
+                    "AssetTags": asset_tags,
+                    "LastScanDateTime": last_scan_datetime,
+                    "LastVMScannedDate": last_vm_scanned_date,
+                    "UniqueVulnID": unique_vuln_id,
+                    "QID": qid,
+                    "VulnerabilityTitle": vuln_title,
+                    "Type": vuln_type,
+                    "Severity": severity,
+                    "Port": port,
+                    "Protocol": protocol,
+                    "SSL": ssl,
+                    "Status": status,
+                    "FirstFoundDateTime": first_found,
+                    "LastFoundDateTime": last_found,
+                    "LastTestDateTime": last_test,
+                    "LastUpdateDateTime": last_update,
+                    "TimesFound": times_found,
+                    "Results": results_text,
+                    "QDS": qds,
+                    "QDSSeverity": qds_severity,
+                    "QDSFactors": qds_factors_str,
+                }
+            )
 
     return results
 
-def save_to_csv(data, filename='host_vm_detections110.csv'):
+
+def save_to_csv(data, filename="host_vm_detections110.csv"):
     if not data:
         print("No data to save.")
         return
-        
-    fieldnames = ['AssetID', 'AssetIP', 'AssetName', 'NetBIOS', 'OS', 'AssetTags', 
-                  'LastScanDateTime', 'LastVMScannedDate', 'UniqueVulnID', 'QID', 
-                  'Type', 'Severity', 'Port', 'Protocol', 'SSL', 'Status', 
-                  'FirstFoundDateTime', 'LastFoundDateTime', 'LastTestDateTime', 
-                  'LastUpdateDateTime', 'TimesFound', 'Results', 'QDS', 'QDSSeverity', 'QDSFactors']
-    
-    with open(filename, mode='w', newline='', encoding='utf-8') as csvfile:
+
+    fieldnames = [
+        "AssetID",
+        "AssetIP",
+        "AssetName",
+        "NetBIOS",
+        "OS",
+        "AssetTags",
+        "LastScanDateTime",
+        "LastVMScannedDate",
+        "UniqueVulnID",
+        "QID",
+        "VulnerabilityTitle",
+        "Type",
+        "Severity",
+        "Port",
+        "Protocol",
+        "SSL",
+        "Status",
+        "FirstFoundDateTime",
+        "LastFoundDateTime",
+        "LastTestDateTime",
+        "LastUpdateDateTime",
+        "TimesFound",
+        "Results",
+        "QDS",
+        "QDSSeverity",
+        "QDSFactors",
+    ]
+
+    with open(filename, mode="w", newline="", encoding="utf-8") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         for row in tqdm(data, desc="Saving to CSV", unit="record"):
             writer.writerow(row)
     print(f"Saved {len(data)} records to {filename}")
 
+
 def handle_truncation(xml_data):
     """
     Check if the response is truncated and return the next URL if needed.
     """
     root = ET.fromstring(xml_data)
-    warning = root.find('.//WARNING')
-    
+    warning = root.find(".//WARNING")
+
     if warning is not None:
-        code = warning.findtext('CODE')
-        text = warning.findtext('TEXT')
-        next_url = warning.findtext('URL')
-        
-        if code == '1980':  # Truncation warning code
+        code = warning.findtext("CODE")
+        text = warning.findtext("TEXT")
+        next_url = warning.findtext("URL")
+
+        if code == "1980":  # Truncation warning code
             print(f"Warning: {text}")
             print(f"Next URL: {next_url}")
             return next_url
-    
+
     return None
+
 
 def fetch_all_detections():
     """
@@ -182,20 +326,22 @@ def fetch_all_detections():
     all_detections = []
     next_url = None
     page_count = 1
-    
+
     while True:
         print(f"Fetching page {page_count}...")
-        
+
         if next_url:
             # Use the next URL provided by Qualys for pagination
-            headers = {'X-Requested-With': 'requests'}
-            response = requests.get(next_url, auth=(USERNAME, PASSWORD), headers=headers)
-            
+            headers = {"X-Requested-With": "requests"}
+            response = requests.get(
+                next_url, auth=(USERNAME, PASSWORD), headers=headers
+            )
+
             if response.status_code != 200:
                 print(f"API call failed with status code {response.status_code}")
                 print(response.text)
                 break
-                
+
             xml_response = response.text
         else:
             # First request
@@ -209,35 +355,38 @@ def fetch_all_detections():
         if detections:
             all_detections.extend(detections)
             print(f"Page {page_count}: Found {len(detections)} detections")
-        
+
         # Check for truncation and get next URL
         next_url = handle_truncation(xml_response)
-        
+
         if not next_url:
             break
-            
+
         page_count += 1
-    
+
     return all_detections
+
 
 def main():
     # Validate configuration
-    if USERNAME == 'your_username' or PASSWORD == 'your_password':
+    if USERNAME == "your_username" or PASSWORD == "your_password":
         print("ERROR: Please update USERNAME and PASSWORD in the script configuration.")
         return
-    
+
     print("Starting Qualys VM Detection data fetch...")
-    
+
     # Fetch all detections (handling pagination)
     all_detections = fetch_all_detections()
-    
+
     if not all_detections:
         print("No detections found.")
         return
-    
+
     print(f"Total detections found: {len(all_detections)}")
+    print(f"Total unique vulnerability titles fetched: {len(qid_title_cache)}")
     save_to_csv(all_detections)
     print("Data export completed successfully!")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
